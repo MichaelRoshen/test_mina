@@ -1,0 +1,163 @@
+require 'mina/bundler'
+require 'mina/rails'
+require 'mina/git'
+require 'mina/rvm'    # for rvm support. (http://rvm.io)
+
+if ENV['stage'].nil?
+  puts 'Please specify a stage name to deploy!'
+  exit
+end
+
+set :rvm_path, '/home/admin/.rvm/scripts/rvm'
+set :apps_path, '/home/admin/apps'
+
+set :repository, 'git@github.com:test_analytic_fe/test-com.git'
+set :repository_config, 'git@github.com:test_analytic_fe/test-com-config.git'
+
+set :user, 'admin'
+set :port, '22'
+
+set :shared_paths, ["tmp", "log"]
+set :keep_releases, 5
+
+load File.expand_path("../deploy/#{ENV['stage']}.rb", __FILE__)
+
+# Put any custom mkdir's in here for when `mina setup` is ran.
+# For Rails apps, we'll make some of the shared paths that are shared between
+# all releases.
+task :setup do
+  queue! %[mkdir -p "#{deploy_to}/shared/log"]
+  queue! %[chmod g+rx,u+rwx "#{deploy_to}/shared/log"]
+
+  queue! %[mkdir -p "#{deploy_to}/shared/config"]
+  queue! %[chmod g+rx,u+rwx "#{deploy_to}/shared/config"]
+
+  queue! %[mkdir -p "#{deploy_to}/shared/tmp/pids"]
+  queue! %[chmod g+rx,u+rwx "#{deploy_to}/shared/tmp/pids"]
+end
+
+namespace :deploy do
+  set :current_release_path, "#{deploy_to}/#{current_path}"
+  set :_git_pull, (ENV['stage'] == 'tiger') ? '' : "git checkout . && git pull"
+  set :config_path, "#{deploy_to}/#{shared_path}/#{repository_config.split("/").last.split(".").first}"
+
+  task :update_configs do
+    queue! %{
+      if [ -d #{config_path} ]; then
+        cd #{config_path}
+        #{_git_pull}
+      else
+        cd #{deploy_to}/#{shared_path}
+        git clone #{repository_config}
+      fi
+    }
+  end
+
+  task :link_configs do
+    set :config_path, "#{deploy_to}/#{shared_path}/#{repository_config.split("/").last.split(".").first}"
+    set :current_release_config_path, "#{current_release_path}/config"
+
+    queue 'echo "-----> Link config files"'
+    queue! %{
+      cd #{config_path}
+
+      for yml_file in *.yml; do
+        ln -s #{config_path}/$yml_file #{current_release_path}/config/$yml_file
+      done
+
+      for json_file in **/*.json; do
+        ln -s #{config_path}/$json_file #{current_release_path}/config/$json_file
+      done
+
+      ln -s #{deploy_to}/#{shared_path}/config/environments/production.rb #{current_release_config_path}/environments/production.rb
+      ln -s #{deploy_to}/#{shared_path}/config/newrelic.yml #{current_release_config_path}/newrelic.yml
+      mkdir -p #{current_release_path}/public/uploads
+      ln -nfs #{deploy_to}/#{shared_path}/uploads/* #{current_release_path}/public/uploads/
+      rm #{current_release_path}/public/uploads/exports
+      rm #{current_release_path}/public/uploads/dp_exports
+    }
+  end
+
+  task :update_crontabs do
+    if ENV['stage'] == 'rb'
+      queue 'echo "-----> Update crontab jobs"'
+      queue! %{
+        cd #{current_release_path}
+        bundle exec whenever -i -f #{current_release_path}/config/schedule.rb
+      }
+    end
+  end
+
+end
+
+desc "Deploys the current version to the server."
+task :deploy => :environment do
+  queue "export PKG_CONFIG_PATH='/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH'"
+  deploy do
+    invoke :'git:clone'
+    invoke :'deploy:link_shared_paths'
+    invoke :'deploy:update_configs'
+    invoke :'bundle:install'
+    invoke :'deploy:update_crontabs'
+
+    to :launch do
+      invoke :'deploy:link_configs'
+      invoke :'deploy:gen_18n_js'
+      invoke :'unicorn:restart'
+      if ENV['stage'] == 'job'
+        invoke :'resque:stop'
+      end
+    end
+  end
+end
+
+namespace :unicorn do
+  set :unicorn_pid, "#{deploy_to}/#{current_path}/tmp/pids/unicorn.pid"
+  set :unicorn_config, "#{deploy_to}/#{shared_path}/config/unicorn_#{ENV['stage']}.rb"
+
+  set :start_unicorn, %{
+    cd "#{deploy_to}/#{current_path}"
+    RAILS_ASSET_ID=2#{Time.now.to_s[0,13].gsub(/-| /, "").reverse}9 bundle exec unicorn -c #{unicorn_config} -E #{rails_env} -D
+  }
+
+  desc "Start unicorn"
+  task :start => :environment do
+    queue 'echo "-----> Start Unicorn"'
+    queue! start_unicorn
+  end
+
+  desc "Stop unicorn"
+  task :stop do
+    queue 'echo "-----> Stop Unicorn"'
+    queue! %{
+      test -s "#{unicorn_pid}" && kill -QUIT `cat "#{unicorn_pid}"` && echo "Stop Ok" && exit 0
+      echo >&2 "Not running"
+    }
+  end
+
+  desc "Restart unicorn"
+  task :restart => :environment do
+    queue 'echo "-----> Restart Unicorn"'
+    #invoke :'unicorn:stop'
+    #invoke :'unicorn:start'
+    queue! %{
+      test -s "#{unicorn_pid}" && kill -USR2 `cat "#{unicorn_pid}"` && echo "Restart Ok" && exit 0
+      echo >&2 "Not running"
+    }
+  end
+end
+
+namespace :resque do
+  desc "Stop resque workers"
+  task :stop do
+    queue 'echo "-----> Stop resque workers"'
+    queue! %{
+      cd /home/admin/apps/god/pids
+      for pid_file in *.pid; do
+        if [ $pid_file != 'unicorn.pid' ] && [ $pid_file != '*.pid' ]; then
+          kill -QUIT `cat "$pid_file"` && echo "Stop $pid_file `cat $pid_file` Ok"
+        fi
+      done
+    }
+  end
+end

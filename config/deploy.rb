@@ -1,9 +1,13 @@
 require 'mina/bundler'
 require 'mina/rails'
 require 'mina/git'
-# require 'mina/rbenv'  # for rbenv support. (http://rbenv.org)
-require 'mina/rvm'    # for rvm support. (http://rvm.io)
+require 'mina/rvm' 
 
+
+if ENV['stage'].nil?
+  puts "Please specify a stage name to deploy!"
+  exit
+end
 # Basic settings:
 #   domain       - The hostname to SSH to.
 #   deploy_to    - Path to deploy into.
@@ -15,7 +19,8 @@ set :deploy_to, '/home/test_rails4'
 set :repository, 'git@github.com:MichaelRoshen/test_mina.git'
 set :branch, 'master'
 set :term_mode, :pretty
-set :rails_env, 'production'
+
+set :keep_releases, 5
 
 # For system-wide RVM install.
 set :rvm_path, '/usr/local/rvm/bin/rvm'
@@ -44,6 +49,9 @@ end
 # Put any custom mkdir's in here for when `mina setup` is ran.
 # For Rails apps, we'll make some of the shared paths that are shared between
 # all releases.
+
+load File.expand_path("../deploy/#{ENV['stage']}.rb", __FILE__)
+
 task :setup => :environment do
   queue! %[mkdir -p "#{deploy_to}/#{shared_path}/log"]
   queue! %[chmod g+rx,u+rwx "#{deploy_to}/#{shared_path}/log"]
